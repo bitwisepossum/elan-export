@@ -8,14 +8,33 @@ Helper scripts for exporting annotation data from [ELAN](https://archive.mpi.nl/
 
 Export a **two-tier interview** (interviewer + participant) into a single formatted transcript. Consecutive turns by the same speaker are merged for readability.
 
+Run with no arguments to launch **interactive mode**, which walks through all options with prompts and sensible defaults:
+
+```
+python3 elan_interview.py
+```
+
+Or pass the file directly for non-interactive use:
+
 ```
 python3 elan_interview.py interview.eaf
 ```
 
+**Batch processing** a directory or glob pattern:
+
+```
+python3 elan_interview.py --batch ./interviews/
+python3 elan_interview.py --batch "*.eaf" --output-dir ./transcripts/
+```
+
 | Flag | Description |
 |---|---|
-| `eaf_file` | Path to the `.eaf` file |
+| `eaf_file` | Path to the `.eaf` file, or a directory/glob when using `--batch` |
+| `-i` / `--interactive` | Interactive mode: prompt for all options (also triggered when no arguments are given) |
 | `-o FILE` | Output file path (default: same name as input) |
+| `--batch` | Process all `.eaf` files at the given path |
+| `--output-dir DIR` | Batch mode: write all outputs to DIR (default: alongside each input) |
+| `--fail-fast` | Batch mode: stop after the first failure |
 | `--int-tier NAME` | Tier ID for the interviewer (default: `INT_speech`) |
 | `--participant-tier NAME` | Tier ID for the participant (default: `PARTICIPANT_speech`) |
 | `--int-name NAME` | Display name for the interviewer (default: `Interviewer`) |
