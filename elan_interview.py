@@ -397,6 +397,244 @@ def process_single_file(eaf_path, output_path, args, quiet=False):
         return False
 
 
+def prompt_choice(message, default='', validator=None, attempts=3):
+    """Prompt user for input, returning default on empty entry.
+
+    If validator is provided it is called with the stripped value and should
+    return (True, value) on success or (False, error_message) on failure.
+    Re-prompts up to `attempts` times before giving up (returns None).
+    """
+    for _ in range(attempts):
+        try:
+            raw = input(message)
+        except EOFError:
+            return None
+        value = raw.strip() or default
+        if validator is not None:
+            ok, result = validator(value)
+            if ok:
+                return result
+            print(f"  {result}")
+        else:
+            return value
+    return None
+
+
+def run_interactive(prefill_file=None):
+    """Walk the user through configuration interactively, then process."""
+    if not sys.stdin.isatty():
+        print("Error: interactive mode requires a terminal (stdin is not a tty).")
+        return 1
+
+    print("=== ELAN Export — Interactive Mode ===\n")
+
+    # ── Group 1: Essentials ──────────────────────────────────────────────────
+    # Batch or single
+    def validate_mode(v):
+        v = v.lower()
+        if v in ('s', 'b'):
+            return True, v
+        return False, "Enter 's' for single file or 'b' for batch."
+
+    mode = prompt_choice("Mode — [s]ingle file or [b]atch? (s): ", default='s',
+                         validator=validate_mode)
+    if mode is None:
+        print("Error: could not read mode.")
+        return 1
+    is_batch = mode == 'b'
+
+    # File / directory
+    def validate_file(v):
+        if not v:
+            return False, "Path is required."
+        if is_batch:
+            p = Path(v)
+            if p.is_dir():
+                files = sorted(p.glob('*.eaf'))
+            else:
+                files = sorted(f for f in Path('.').glob(v) if f.suffix.lower() == '.eaf')
+            if not files:
+                return False, f"No .eaf files found at: {v}"
+            return True, v
+        else:
+            p = Path(v)
+            if not p.exists():
+                return False, f"File not found: {v}"
+            return True, v
+
+    if prefill_file:
+        file_arg = prefill_file
+        ok, result = validate_file(file_arg)
+        if not ok:
+            print(f"  {result}")
+            file_arg = prompt_choice("EAF file path: ", validator=validate_file)
+    else:
+        label = "Directory or glob pattern: " if is_batch else "EAF file path: "
+        file_arg = prompt_choice(label, validator=validate_file)
+
+    if file_arg is None:
+        print("Error: no valid file path provided.")
+        return 1
+
+    # Output format
+    def validate_fmt(v):
+        v = v.lower()
+        if v in ('rtf', 'md'):
+            return True, v
+        return False, "Enter 'rtf' or 'md'."
+
+    fmt = prompt_choice("Output format [rtf/md] (rtf): ", default='rtf',
+                        validator=validate_fmt)
+    if fmt is None:
+        fmt = 'rtf'
+    use_markdown = fmt == 'md'
+
+    # ── Group 2: Output location ─────────────────────────────────────────────
+    output_path_str = None
+    output_dir_str = None
+    fail_fast = False
+
+    if is_batch:
+        output_dir_str = prompt_choice(
+            "Output directory (Enter for alongside each input): ", default='')
+        if output_dir_str:
+            d = Path(output_dir_str)
+            if not d.is_dir():
+                print(f"  Warning: '{output_dir_str}' is not an existing directory — will use alongside inputs.")
+                output_dir_str = ''
+
+        ff = prompt_choice("Stop on first failure? [y/n] (n): ", default='n') or 'n'
+        fail_fast = ff.lower() == 'y'
+    else:
+        eaf_p = Path(file_arg)
+        default_out = str(eaf_p.with_suffix('.md' if use_markdown else '.rtf'))
+        output_path_str = prompt_choice(
+            f"Output path (Enter for {default_out}): ", default=default_out)
+
+    # ── Group 3: Advanced (optional) ─────────────────────────────────────────
+    no_timestamps = False
+    no_merge = False
+    max_gap = 5.0
+    spaces = False
+    compact = False
+    font_size = 12
+    int_tier = 'INT_speech'
+    participant_tier = 'PARTICIPANT_speech'
+    int_name = 'Interviewer'
+    participant_name = 'Participant'
+
+    adv = prompt_choice("\nConfigure advanced options? [y/n] (n): ", default='n') or 'n'
+    if adv.lower() == 'y':
+        ts = prompt_choice("Include timestamps? [y/n] (y): ", default='y') or 'y'
+        no_timestamps = ts.lower() == 'n'
+
+        mg = prompt_choice("Merge consecutive turns by same speaker? [y/n] (y): ", default='y') or 'y'
+        no_merge = mg.lower() == 'n'
+
+        if not no_merge:
+            def validate_gap(v):
+                try:
+                    f = float(v)
+                    if f >= 0:
+                        return True, f
+                    return False, "Gap must be >= 0."
+                except ValueError:
+                    return False, "Enter a number (seconds)."
+
+            gap = prompt_choice("Max merge gap in seconds (5.0): ", default='5.0',
+                                validator=validate_gap)
+            max_gap = gap if gap is not None else 5.0
+
+            sp = prompt_choice("Join segments with spaces instead of line breaks? [y/n] (n): ", default='n') or 'n'
+            spaces = sp.lower() == 'y'
+
+        cmp = prompt_choice("Compact format (speaker + text on same line)? [y/n] (n): ", default='n') or 'n'
+        compact = cmp.lower() == 'y'
+
+        if not use_markdown:
+            def validate_font(v):
+                try:
+                    n = int(v)
+                    if 6 <= n <= 72:
+                        return True, n
+                    return False, "Font size must be between 6 and 72."
+                except ValueError:
+                    return False, "Enter an integer."
+
+            fs = prompt_choice("Font size in points (12): ", default='12',
+                               validator=validate_font)
+            font_size = fs if fs is not None else 12
+
+        print("\n  --- Tier configuration ---")
+        int_tier = prompt_choice(f"Interviewer tier ID ({int_tier}): ", default=int_tier)
+        participant_tier = prompt_choice(f"Participant tier ID ({participant_tier}): ", default=participant_tier)
+        int_name = prompt_choice(f"Interviewer display name ({int_name}): ", default=int_name)
+        participant_name = prompt_choice(f"Participant display name ({participant_name}): ", default=participant_name)
+
+    # ── Summary + confirmation ────────────────────────────────────────────────
+    print("\n--- Configuration ---")
+    print(f"  Mode:         {'Batch' if is_batch else 'Single file'}")
+    print(f"  Input:        {file_arg}")
+    if is_batch:
+        print(f"  Output dir:   {output_dir_str or '(alongside inputs)'}")
+        print(f"  Fail fast:    {'yes' if fail_fast else 'no'}")
+    else:
+        print(f"  Output:       {output_path_str}")
+    fmt_label = f"Markdown" if use_markdown else f"RTF ({font_size}pt)"
+    print(f"  Format:       {fmt_label}")
+    print(f"  Timestamps:   {'no' if no_timestamps else 'yes'}")
+    if no_merge:
+        print(f"  Merging:      no")
+    else:
+        join_method = 'spaces' if spaces else 'line breaks'
+        print(f"  Merging:      yes (gap: {max_gap}s, {join_method})")
+    print(f"  Compact:      {'yes' if compact else 'no'}")
+    print(f"  Tiers:        {int_tier} / {participant_tier}")
+    print(f"  Names:        {int_name} / {participant_name}")
+    print()
+
+    go = prompt_choice("Proceed? [Y/n]: ", default='y') or 'y'
+    if go.lower() == 'n':
+        print("Aborted.")
+        return 0
+
+    # ── Build args namespace and dispatch ─────────────────────────────────────
+    import argparse as _ap
+    args = _ap.Namespace(
+        eaf_file=file_arg,
+        output=output_path_str if not is_batch else None,
+        batch=is_batch,
+        output_dir=output_dir_str or None,
+        fail_fast=fail_fast,
+        markdown=use_markdown,
+        no_timestamps=no_timestamps,
+        no_merge=no_merge,
+        max_gap=max_gap,
+        spaces=spaces,
+        compact=compact,
+        font_size=font_size,
+        int_tier=int_tier,
+        participant_tier=participant_tier,
+        int_name=int_name,
+        participant_name=participant_name,
+        interactive=False,
+    )
+
+    print()
+    if is_batch:
+        output_dir = Path(output_dir_str) if output_dir_str else None
+        files = resolve_batch_files(file_arg)
+        if not files:
+            print(f"Error: No .eaf files found at: {file_arg}")
+            return 1
+        return run_batch(files, output_dir, args, fail_fast)
+    else:
+        eaf_path = Path(file_arg)
+        suffix = '.md' if use_markdown else '.rtf'
+        output_path = Path(output_path_str) if output_path_str else eaf_path.with_suffix(suffix)
+        return 0 if process_single_file(eaf_path, output_path, args) else 1
+
+
 def resolve_batch_files(input_arg):
     """Return a sorted list of .eaf Paths from a directory or glob pattern."""
     p = Path(input_arg)
@@ -496,13 +734,23 @@ def run_batch(files, output_dir, args, fail_fast):
 
 
 def main():
+    # Auto-enter interactive mode when invoked with no arguments
+    if len(sys.argv) == 1:
+        return run_interactive()
+
     parser = argparse.ArgumentParser(
         description='Export ELAN .eaf file to readable RTF format'
     )
     parser.add_argument(
         'eaf_file',
+        nargs='?',
         type=str,
         help='Path to ELAN .eaf file, or a directory/glob pattern when using --batch'
+    )
+    parser.add_argument(
+        '-i', '--interactive',
+        action='store_true',
+        help='Interactive mode: prompt for all options'
     )
     parser.add_argument(
         '-o', '--output',
@@ -589,6 +837,13 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.interactive:
+        return run_interactive(prefill_file=args.eaf_file)
+
+    if not args.eaf_file:
+        parser.print_help()
+        return 1
 
     # Validate font size (only relevant for RTF)
     if not args.markdown and (args.font_size < 6 or args.font_size > 72):
