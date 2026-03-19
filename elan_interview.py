@@ -9,6 +9,9 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 import argparse
 from datetime import timedelta
+import sys
+import time
+import shutil
 
 
 def format_timestamp(milliseconds):
@@ -402,36 +405,94 @@ def resolve_batch_files(input_arg):
     return sorted(f for f in Path('.').glob(input_arg) if f.suffix.lower() == '.eaf')
 
 
+class BatchProgress:
+    """Tracks and displays progress for batch EAF processing."""
+
+    def __init__(self, total):
+        self.total = total
+        self.completed = 0
+        self.succeeded = 0
+        self.failed = []
+        self.start_time = time.monotonic()
+        self._width = len(str(total))
+
+    def update(self, eaf_path, success):
+        self.completed += 1
+        if success:
+            self.succeeded += 1
+        else:
+            self.failed.append(eaf_path)
+        self._print_line(eaf_path, success)
+
+    def _fmt_time(self, seconds):
+        s = int(seconds)
+        if s < 3600:
+            return f"{s // 60}:{s % 60:02d}"
+        return f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+    def _print_line(self, eaf_path, success):
+        elapsed = time.monotonic() - self.start_time
+        pct = self.completed / self.total * 100
+        status = "OK  " if success else "FAIL"
+
+        if self.completed > 0 and self.completed < self.total:
+            eta = elapsed / self.completed * (self.total - self.completed)
+            eta_str = self._fmt_time(eta)
+        else:
+            eta_str = "0:00"
+
+        try:
+            term_width = shutil.get_terminal_size().columns
+        except Exception:
+            term_width = 80
+
+        bar_width = min(20, max(8, term_width - 55))
+        filled = int(bar_width * self.completed / self.total)
+        if self.completed == self.total:
+            bar = '=' * bar_width
+        else:
+            bar = '=' * filled + '>' + ' ' * (bar_width - filled - 1)
+
+        prefix = f"  [{self.completed:>{self._width}}/{self.total}] [{bar}] {pct:5.1f}%  {self._fmt_time(elapsed)}<{eta_str}  "
+        max_name = max(8, term_width - len(prefix) - 6)
+        name = eaf_path.name
+        if len(name) > max_name:
+            name = name[:max_name - 3] + '...'
+
+        print(f"{prefix}{name} {status}")
+
+    def print_summary(self):
+        elapsed = self._fmt_time(time.monotonic() - self.start_time)
+        sep = '=' * 40
+        print(f"\n{sep}")
+        print(f"  Batch complete: {self.succeeded}/{self.total} succeeded in {elapsed}")
+        if self.failed:
+            print(f"  Failed ({len(self.failed)}):")
+            for f in self.failed:
+                print(f"    {f}")
+        print(sep)
+
+
 def run_batch(files, output_dir, args, fail_fast):
     """Process a list of EAF files, report progress and summary. Returns 0/1."""
-    total = len(files)
-    succeeded = 0
-    failed = []
     suffix = '.md' if args.markdown else '.rtf'
+    progress = BatchProgress(len(files))
 
-    for i, eaf_path in enumerate(files, start=1):
+    for eaf_path in files:
         if output_dir is not None:
             out_path = output_dir / eaf_path.with_suffix(suffix).name
         else:
             out_path = eaf_path.with_suffix(suffix)
 
-        print(f"[{i}/{total}] {eaf_path.name} -> {out_path.name}")
+        success = process_single_file(eaf_path, out_path, args, quiet=True)
+        progress.update(eaf_path, success)
 
-        if process_single_file(eaf_path, out_path, args, quiet=True):
-            succeeded += 1
-        else:
-            failed.append(eaf_path)
-            if fail_fast:
-                print("--fail-fast: aborting after first failure.")
-                break
+        if not success and fail_fast:
+            print("  --fail-fast: aborting after first failure.")
+            break
 
-    print(f"\nBatch complete: {succeeded}/{total} succeeded.")
-    if failed:
-        print(f"Failed ({len(failed)}):")
-        for f in failed:
-            print(f"  {f}")
-        return 1
-    return 0
+    progress.print_summary()
+    return 0 if not progress.failed else 1
 
 
 def main():
