@@ -311,6 +311,129 @@ def create_rtf(annotations, output_path, include_timestamps=True, compact=False,
         f.write('\n'.join(rtf_content))
 
 
+def process_single_file(eaf_path, output_path, args, quiet=False):
+    """Process one EAF file. Returns True on success, False on failure."""
+    if not quiet:
+        print(f"Reading ELAN file: {eaf_path}")
+
+    try:
+        annotations = parse_eaf_file(
+            eaf_path,
+            int_tier=args.int_tier,
+            participant_tier=args.participant_tier,
+            int_name=args.int_name,
+            participant_name=args.participant_name,
+        )
+
+        if not annotations:
+            print(f"Warning: No annotations found in '{args.int_tier}' or '{args.participant_tier}' tiers")
+            return False
+
+        original_count = len(annotations)
+        if not quiet:
+            print(f"Found {original_count} annotations")
+
+        if not args.no_merge:
+            max_gap_ms = int(args.max_gap * 1000)
+            annotations = merge_consecutive_turns(
+                annotations,
+                max_gap_ms,
+                use_linebreaks=not args.spaces
+            )
+            if not quiet:
+                join_method = "spaces" if args.spaces else "line breaks"
+                print(f"Merged into {len(annotations)} turns (gap: {args.max_gap}s, joined with {join_method})")
+
+        if args.markdown:
+            create_markdown(
+                annotations,
+                output_path,
+                include_timestamps=not args.no_timestamps,
+                compact=args.compact,
+                original_count=original_count,
+                eaf_filename=eaf_path.name,
+                int_name=args.int_name,
+                participant_name=args.participant_name,
+            )
+        else:
+            create_rtf(
+                annotations,
+                output_path,
+                include_timestamps=not args.no_timestamps,
+                compact=args.compact,
+                font_size=args.font_size,
+                original_count=original_count,
+                eaf_filename=eaf_path.name,
+                int_name=args.int_name,
+                participant_name=args.participant_name,
+            )
+
+        if not quiet:
+            print(f"Successfully exported to: {output_path}")
+            if not args.markdown:
+                print(f"Font size: {args.font_size}pt")
+            print(f"\nStatistics:")
+            print(f"  Original annotations: {original_count}")
+            print(f"  Final turns: {len(annotations)}")
+            int_count = sum(1 for a in annotations if a['speaker'] == args.int_name)
+            part_count = sum(1 for a in annotations if a['speaker'] == args.participant_name)
+            print(f"  {args.int_name} turns: {int_count}")
+            print(f"  {args.participant_name} turns: {part_count}")
+            if annotations:
+                print(f"  Total duration: {format_timestamp(annotations[-1]['end'])}")
+
+        return True
+
+    except ET.ParseError as e:
+        print(f"Error parsing EAF file: {e}")
+        return False
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def resolve_batch_files(input_arg):
+    """Return a sorted list of .eaf Paths from a directory or glob pattern."""
+    p = Path(input_arg)
+    if p.is_dir():
+        return sorted(p.glob('*.eaf'))
+    return sorted(f for f in Path('.').glob(input_arg) if f.suffix.lower() == '.eaf')
+
+
+def run_batch(files, output_dir, args, fail_fast):
+    """Process a list of EAF files, report progress and summary. Returns 0/1."""
+    total = len(files)
+    succeeded = 0
+    failed = []
+    suffix = '.md' if args.markdown else '.rtf'
+
+    for i, eaf_path in enumerate(files, start=1):
+        if output_dir is not None:
+            out_path = output_dir / eaf_path.with_suffix(suffix).name
+        else:
+            out_path = eaf_path.with_suffix(suffix)
+
+        print(f"[{i}/{total}] {eaf_path.name} -> {out_path.name}")
+
+        if process_single_file(eaf_path, out_path, args, quiet=True):
+            succeeded += 1
+        else:
+            failed.append(eaf_path)
+            if fail_fast:
+                print("--fail-fast: aborting after first failure.")
+                break
+
+    print(f"\nBatch complete: {succeeded}/{total} succeeded.")
+    if failed:
+        print(f"Failed ({len(failed)}):")
+        for f in failed:
+            print(f"  {f}")
+        return 1
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Export ELAN .eaf file to readable RTF format'
@@ -318,12 +441,29 @@ def main():
     parser.add_argument(
         'eaf_file',
         type=str,
-        help='Path to ELAN .eaf file'
+        help='Path to ELAN .eaf file, or a directory/glob pattern when using --batch'
     )
     parser.add_argument(
         '-o', '--output',
         type=str,
-        help='Output RTF file path (default: same name as input with .rtf extension)'
+        help='Output file path (default: same name as input with .rtf/.md extension)'
+    )
+    parser.add_argument(
+        '--batch',
+        action='store_true',
+        help='Process all .eaf files at eaf_file (directory or glob pattern)'
+    )
+    parser.add_argument(
+        '--output-dir',
+        type=str,
+        default=None,
+        metavar='DIR',
+        help='Batch mode: write all outputs to DIR (default: alongside each input)'
+    )
+    parser.add_argument(
+        '--fail-fast',
+        action='store_true',
+        help='Batch mode: stop after the first failure'
     )
     parser.add_argument(
         '--no-timestamps',
@@ -389,7 +529,32 @@ def main():
 
     args = parser.parse_args()
 
-    # Validate input file
+    # Validate font size (only relevant for RTF)
+    if not args.markdown and (args.font_size < 6 or args.font_size > 72):
+        print(f"Error: Font size must be between 6 and 72 points")
+        return 1
+
+    # Batch mode
+    if args.batch:
+        if args.output:
+            print("Error: --output cannot be used with --batch; use --output-dir instead")
+            return 1
+
+        output_dir = None
+        if args.output_dir:
+            output_dir = Path(args.output_dir)
+            if not output_dir.is_dir():
+                print(f"Error: --output-dir does not exist: {output_dir}")
+                return 1
+
+        files = resolve_batch_files(args.eaf_file)
+        if not files:
+            print(f"Error: No .eaf files found at: {args.eaf_file}")
+            return 1
+
+        return run_batch(files, output_dir, args, args.fail_fast)
+
+    # Single-file mode
     eaf_path = Path(args.eaf_file)
     if not eaf_path.exists():
         print(f"Error: File not found: {eaf_path}")
@@ -398,101 +563,13 @@ def main():
     if not eaf_path.suffix.lower() == '.eaf':
         print(f"Warning: File does not have .eaf extension: {eaf_path}")
 
-    # Validate font size (only relevant for RTF)
-    if not args.markdown and (args.font_size < 6 or args.font_size > 72):
-        print(f"Error: Font size must be between 6 and 72 points")
-        return 1
-
-    # Determine output path
     if args.output:
         output_path = Path(args.output)
     else:
         suffix = '.md' if args.markdown else '.rtf'
         output_path = eaf_path.with_suffix(suffix)
 
-    print(f"Reading ELAN file: {eaf_path}")
-
-    try:
-        # Parse EAF file
-        annotations = parse_eaf_file(
-            eaf_path,
-            int_tier=args.int_tier,
-            participant_tier=args.participant_tier,
-            int_name=args.int_name,
-            participant_name=args.participant_name,
-        )
-
-        if not annotations:
-            print(f"Warning: No annotations found in '{args.int_tier}' or '{args.participant_tier}' tiers")
-            return 1
-
-        original_count = len(annotations)
-        print(f"Found {original_count} annotations")
-
-        # Merge consecutive turns
-        if not args.no_merge:
-            max_gap_ms = int(args.max_gap * 1000)
-            annotations = merge_consecutive_turns(
-                annotations,
-                max_gap_ms,
-                use_linebreaks=not args.spaces
-            )
-            join_method = "spaces" if args.spaces else "line breaks"
-            print(f"Merged into {len(annotations)} turns (gap: {args.max_gap}s, joined with {join_method})")
-
-        # Create output
-        if args.markdown:
-            create_markdown(
-                annotations,
-                output_path,
-                include_timestamps=not args.no_timestamps,
-                compact=args.compact,
-                original_count=original_count,
-                eaf_filename=eaf_path.name,
-                int_name=args.int_name,
-                participant_name=args.participant_name,
-            )
-        else:
-            create_rtf(
-                annotations,
-                output_path,
-                include_timestamps=not args.no_timestamps,
-                compact=args.compact,
-                font_size=args.font_size,
-                original_count=original_count,
-                eaf_filename=eaf_path.name,
-                int_name=args.int_name,
-                participant_name=args.participant_name,
-            )
-
-        print(f"Successfully exported to: {output_path}")
-        if not args.markdown:
-            print(f"Font size: {args.font_size}pt")
-        print(f"\nStatistics:")
-        print(f"  Original annotations: {original_count}")
-        print(f"  Final turns: {len(annotations)}")
-
-        int_count = sum(1 for a in annotations if a['speaker'] == args.int_name)
-        part_count = sum(1 for a in annotations if a['speaker'] == args.participant_name)
-
-        print(f"  {args.int_name} turns: {int_count}")
-        print(f"  {args.participant_name} turns: {part_count}")
-
-        if annotations:
-            duration_ms = annotations[-1]['end']
-            duration = format_timestamp(duration_ms)
-            print(f"  Total duration: {duration}")
-
-        return 0
-
-    except ET.ParseError as e:
-        print(f"Error parsing EAF file: {e}")
-        return 1
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
+    return 0 if process_single_file(eaf_path, output_path, args) else 1
 
 
 if __name__ == '__main__':
